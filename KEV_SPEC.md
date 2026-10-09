@@ -11,7 +11,8 @@ TypeSafe's System One API (`POST /v1/systemone`) with the same request/response 
   If the server sets `KEV_API_KEY`, NucleiSniper sends it.
 - R4. An oversized request to Kev (HTTP 422, state > 65,536 tokens) splits the batch, just as a
   Jev `max_tokens_exceeded` 400 does.
-- R5. Scores from different models never mix: `--resume` caches stay keyed by model name.
+- R5. Scores from different endpoints or models never mix: `--resume` caches are keyed by
+  endpoint and model name. Existing caches migrate as hosted TypeSafe scores.
 - R6. Verified against kev-0.8b, kev-4b and kev-9b running on this machine.
 
 ## Spec
@@ -42,6 +43,9 @@ the token counts per batch so users can lower `--batch-size` if needed.
 - `test_kev.py` (stdlib `unittest`, no network): a fake System One server on localhost checks
   - requests go to `--endpoint`, with no `Authorization` header when no key is set;
   - a 422 token error splits the batch and every template still gets a score.
+- `test_pr_regressions.py` checks CLI resume isolation by endpoint and model, migration of
+  existing hosted score caches, and authenticated/open/failed eval readiness using stub processes.
+- Run all checks with `python3 -m unittest test_kev test_pr_regressions`.
 
 ## Evaluation
 - `eval_kev.sh` starts each Kev model in turn (port 8009) and runs NucleiSniper with
@@ -50,7 +54,8 @@ the token counts per batch so users can lower `--batch-size` if needed.
 - Output per run: `eval/<model>-b<batch size>[-<page>].json` (scores, per-batch token usage, timings) and a
   summary table: scored templates, failed batches, wall time, tokens per batch, and top-10 overlap between runs
   on the same page. `ONLY`, `BATCH_SIZE` and `SITE` select models, batch size and test page (`eval/site`,
-  `eval/site-joomla`).
+  `eval/site-joomla`). Kev readiness probes use `KEV_API_KEY` when set and stop after
+  `KEV_START_TIMEOUT` seconds (default: 600), including a per-probe HTTP timeout.
 
 ### Results (2026-10-09, Apple Silicon, MLX)
 Kev 1.0 weights, nuclei-templates v10.5.0, 400 sampled `http/` templates (seed 0); the prefilter kept 171

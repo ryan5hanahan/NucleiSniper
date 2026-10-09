@@ -1429,9 +1429,35 @@ def connect_template_index(db_path: Path) -> sqlite3.Connection:
 
 
 def ensure_scores(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(scores)")}
+    if columns and "endpoint" not in columns:
+        # Scores written before endpoint support came from hosted TypeSafe.
+        conn.execute("SAVEPOINT migrate_scores")
+        try:
+            conn.execute("ALTER TABLE scores RENAME TO scores_legacy")
+            ensure_scores(conn)
+            conn.execute(
+                """
+                INSERT INTO scores (
+                    endpoint, url, model, file_path, template_id, name, score,
+                    confidence, probabilities, severity, tags
+                )
+                SELECT ?, url, model, file_path, template_id, name, score,
+                    confidence, probabilities, severity, tags FROM scores_legacy
+                """,
+                (TYPESAFE_ENDPOINT,),
+            )
+            conn.execute("DROP TABLE scores_legacy")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT migrate_scores")
+            raise
+        finally:
+            conn.execute("RELEASE SAVEPOINT migrate_scores")
+        return
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scores (
+            endpoint TEXT NOT NULL,
             url TEXT NOT NULL,
             model TEXT NOT NULL,
             file_path TEXT NOT NULL,
@@ -1442,7 +1468,7 @@ def ensure_scores(conn: sqlite3.Connection) -> None:
             probabilities TEXT NOT NULL,
             severity TEXT NOT NULL,
             tags TEXT NOT NULL,
-            PRIMARY KEY (url, model, file_path)
+            PRIMARY KEY (endpoint, url, model, file_path)
         )
         """
     )
@@ -1483,26 +1509,26 @@ def load_cached_profile(conn: sqlite3.Connection, url: str) -> dict[str, Any] | 
     return json.loads(row[0])
 
 
-def cached_paths(conn: sqlite3.Connection, url: str, model: str) -> set[str]:
+def cached_paths(conn: sqlite3.Connection, url: str, model: str, endpoint: str = TYPESAFE_ENDPOINT) -> set[str]:
     ensure_scores(conn)
     return {
         row[0]
         for row in conn.execute(
-            "SELECT file_path FROM scores WHERE url = ? AND model = ?",
-            (url, model),
+            "SELECT file_path FROM scores WHERE endpoint = ? AND url = ? AND model = ?",
+            (endpoint, url, model),
         )
     }
 
 
-def load_ranked(conn: sqlite3.Connection, url: str, model: str) -> list[RankedTemplate]:
+def load_ranked(conn: sqlite3.Connection, url: str, model: str, endpoint: str = TYPESAFE_ENDPOINT) -> list[RankedTemplate]:
     ensure_scores(conn)
     ranked: list[RankedTemplate] = []
     rows = conn.execute(
         """
         SELECT template_id, name, file_path, score, confidence, probabilities, severity, tags
-        FROM scores WHERE url = ? AND model = ?
+        FROM scores WHERE endpoint = ? AND url = ? AND model = ?
         """,
-        (url, model),
+        (endpoint, url, model),
     )
     for template_id, name, file_path, score, confidence, probabilities, severity, tags in rows:
         ranked.append(
@@ -1520,16 +1546,16 @@ def load_ranked(conn: sqlite3.Connection, url: str, model: str) -> list[RankedTe
     return ranked
 
 
-def store_ranked(conn: sqlite3.Connection, url: str, model: str, ranked: list[RankedTemplate]) -> None:
+def store_ranked(conn: sqlite3.Connection, url: str, model: str, ranked: list[RankedTemplate], endpoint: str = TYPESAFE_ENDPOINT) -> None:
     if not ranked:
         return
     ensure_scores(conn)
     conn.executemany(
         """
         INSERT INTO scores (
-            url, model, file_path, template_id, name, score, confidence, probabilities, severity, tags
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(url, model, file_path) DO UPDATE SET
+            endpoint, url, model, file_path, template_id, name, score, confidence, probabilities, severity, tags
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint, url, model, file_path) DO UPDATE SET
             template_id = excluded.template_id,
             name = excluded.name,
             score = excluded.score,
@@ -1540,6 +1566,7 @@ def store_ranked(conn: sqlite3.Connection, url: str, model: str, ranked: list[Ra
         """,
         [
             (
+                endpoint,
                 url,
                 model,
                 item.file_path,
@@ -2642,7 +2669,7 @@ def score_targets(
         selected = prefilter_templates(selected, run["target"], args.no_prefilter)
         resumed = 0
         if args.resume and score_conn is not None:
-            known = cached_paths(score_conn, run["url"], args.model)
+            known = cached_paths(score_conn, run["url"], args.model, args.endpoint)
             resumed = sum(1 for template in selected if template.file_path in known)
             selected = [template for template in selected if template.file_path not in known]
             if args.cache_profile and selected:
@@ -2847,7 +2874,7 @@ def score_targets(
         for run in runs:
             if run["error"]:
                 continue
-            cached = load_ranked(score_conn, run["url"], args.model)
+            cached = load_ranked(score_conn, run["url"], args.model, args.endpoint)
             have = {item.file_path for item in run["results"]}
             run["results"].extend(item for item in cached if item.file_path not in have)
     jev_wall_seconds = 0.0
@@ -2880,7 +2907,7 @@ def score_targets(
                 run["batch_input_tokens"].append(usage["input_tokens"])
                 run["jev_seconds"] = round(run["jev_seconds"] + seconds, 3)
                 if score_conn is not None:
-                    store_ranked(score_conn, run["url"], args.model, ranked)
+                    store_ranked(score_conn, run["url"], args.model, ranked, args.endpoint)
         finally:
             if progress_bar is not None:
                 progress_bar.close()

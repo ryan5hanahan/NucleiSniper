@@ -6,6 +6,7 @@
 #   ONLY="kev-0.8b kev-4b" BATCH_SIZE=16 SITE=site-joomla ./eval_kev.sh   # subset / batch size / test page under eval/
 #   The summary covers every run in eval/ against the same page.
 #   ONLY=jev-latest scores with hosted Jev instead (needs TYPESAFE_API_KEY; never run unless named in ONLY).
+#   KEV_START_TIMEOUT sets the model startup deadline in seconds (default: 600).
 set -euo pipefail
 cd "$(dirname "$0")"
 KEV_DIR=${KEV_DIR:-$HOME/tools/kev}
@@ -13,6 +14,7 @@ TEMPLATES=${TEMPLATES:-$HOME/tools/nuclei-templates-v10.5.0}
 PYTHON=${PYTHON:-python3}
 SUBSET_SIZE=${SUBSET_SIZE:-400}
 BATCH_SIZE=${BATCH_SIZE:-50}
+KEV_START_TIMEOUT=${KEV_START_TIMEOUT:-600}
 SITE=${SITE:-site}
 suffix=$([ "$SITE" = site ] || echo "-${SITE#site-}")
 # Kev 1.0 weight commits (the Hub v1.0 tags add only a model card on top of these).
@@ -53,8 +55,17 @@ for entry in "${MODELS[@]}"; do
   if [ "$run" != hosted ]; then
     (cd "$KEV_DIR" && exec uv run --extra serve python -m kev.serve --run "$run" --host 127.0.0.1 --port 8009) >"$out.server.log" 2>&1 &
     kev_pid=$!
-    until curl -sf http://127.0.0.1:8009/v1/models >/dev/null; do
+    readiness_headers=()
+    if [ -n "${KEV_API_KEY:-}" ]; then
+      readiness_headers=(-H "Authorization: Bearer $KEV_API_KEY")
+    fi
+    deadline=$(( $(date +%s) + KEV_START_TIMEOUT ))
+    until curl -sf --connect-timeout 2 --max-time 5 ${readiness_headers[@]+"${readiness_headers[@]}"} http://127.0.0.1:8009/v1/models >/dev/null; do
       kill -0 $kev_pid 2>/dev/null || { echo "[eval] $name server exited, see $out.server.log"; exit 1; }
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "[eval] $name server was not ready within $KEV_START_TIMEOUT seconds, see $out.server.log"
+        exit 1
+      fi
       sleep 5
     done
     endpoint=(--endpoint http://127.0.0.1:8009/v1/systemone)
