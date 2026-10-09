@@ -81,7 +81,7 @@ NucleiSniper solves this — every template still runs, but **high-value checks 
 - Default: score + scan in one go
 - `--no-scan`: score only, save report for later
 - `--report`: scan from an existing report without re-scoring
-- `--resume`: reuse stored scores from SQLite
+- `--resume`: reuse stored scores from SQLite for the same endpoint and model
 - `--dry-run`: preview without spending API credit or running Nuclei
 - `--html-report`: generate a self-contained visual report
 
@@ -102,7 +102,7 @@ python --version
 
 - **Nuclei** installed and on PATH ([install guide](https://docs.projectdiscovery.io/tools/nuclei/install))
 - **Nuclei templates** cloned locally (`nuclei -update-templates`)
-- **TypeSafe API key** — set as `TYPESAFE_API_KEY` environment variable
+- **TypeSafe API key** — set as `TYPESAFE_API_KEY` environment variable, *or* a local [Kev](https://github.com/jaredpalmer/kev) server (no key; see [Example 8](#8-score-with-a-local-kev-server))
 
 ### Set Up a Virtual Environment (recommended)
 ```bash
@@ -223,6 +223,10 @@ python NucleiSniper.py http://target.com `
     --resume -o relevance.json
 ```
 
+Scores are cached by endpoint URL, model name, target URL, and template path. Use the same `--endpoint`, `--model`, and template index to continue a run. Changing the endpoint or model scores those templates separately; switching back reuses that backend's stored scores.
+
+Existing score caches migrate automatically as hosted TypeSafe scores, preserving earlier Jev runs. Keep using the hosted default endpoint to resume those scores.
+
 ### 5. Re-scan Existing Report (Critical/High Only)
 ```powershell
 python NucleiSniper.py --report relevance.json --severity critical,high
@@ -243,6 +247,42 @@ python NucleiSniper.py http://target.com `
     -t ~/nuclei-templates `
     --html-report report.html --no-scan
 ```
+
+### 8. Score with a Local Kev Server
+[Kev](https://github.com/jaredpalmer/kev) answers the same System One API as Jev, on your own machine. Point `--endpoint` at it; no API key is needed unless the server sets `KEV_API_KEY`.
+
+The client uses `TYPESAFE_API_KEY` first, then `KEV_API_KEY`, and omits the authorization header when neither is set. For a protected local server, set the same `KEV_API_KEY` in both terminals and unset `TYPESAFE_API_KEY` in the client terminal so it sends the Kev key.
+
+```bash
+# Terminal 1: start Kev-9B (Kev 1.0 weights; first run downloads ~19 GB)
+git clone --branch kev-1.0 https://github.com/jaredpalmer/kev.git && cd kev
+uv sync --extra serve
+uv run --extra serve python -m kev.serve --port 8009 \
+    --run jaredpalmer/kev-9b@b5d8c18e44c60888d138b65cb6507ff0a5a448a0
+
+# Terminal 2
+python NucleiSniper.py http://target.com -t ~/nuclei-templates \
+    --endpoint http://127.0.0.1:8009/v1/systemone --model kev-9b \
+    --batch-size 16 --threshold 1.0 --scan-min-score 1.0
+```
+
+Why these flags:
+- `--batch-size 16` keeps most requests near Kev's validated 8,192-token context. The default 50 sends ~15–25k tokens per request and ranks slightly worse.
+- Scores on thin pages run low with either backend: on our two test pages Jev (default batch size) scored 4 and 0 templates at 2.0 or more, Kev-9B 0 and 0, so the default `--threshold 2.5` and `--scan-min-score 2.0` kept almost nothing. At 1.0, Kev-9B kept 39 templates for the WordPress page (38 of them WordPress) and 12 for the Joomla page (all 4 Joomla templates included); Jev kept 61 and exactly the 4 Joomla templates. Kev separates relevant from irrelevant templates less sharply than Jev, so expect a few extra templates at the same cut-off.
+- Kev-9B ranked the relevant templates about as well as Jev (WordPress templates: mean rank 35 vs Jev's 34; Joomla templates: ranks 1–4 for both), but took ~26 s for 171 templates on an Apple-Silicon Mac where hosted Jev took under a second. Kev-4B (`jaredpalmer/kev-4b@139fdd94f1b6a6ad80cc15e08fcb99cac885a101`, `--model kev-4b`) is about twice as fast as Kev-9B and nearly as good. Kev-0.8B scores almost everything the same; don't use it for ranking.
+
+#### Reproduce the Kev Evaluation
+
+Run the evaluation from the NucleiSniper checkout after installing Kev's serving dependencies:
+
+```bash
+KEV_DIR=~/tools/kev TEMPLATES=~/tools/nuclei-templates-v10.5.0 \
+    ONLY=kev-9b BATCH_SIZE=16 KEV_START_TIMEOUT=900 ./eval_kev.sh
+```
+
+The script starts Kev on port 8009 and a local test page on port 8010, then scores a fixed sample of 400 templates with `--no-scan`. `ONLY` selects models; omitting it runs all three Kev models. Set `SITE=site-joomla` for the Joomla fixture. Hosted Jev runs only when explicitly selected with `ONLY=jev-latest` and requires a hosted API key. Results, logs, and token-usage summaries are written under `eval/`; see [KEV_SPEC.md](KEV_SPEC.md) for the comparison.
+
+When `KEV_API_KEY` is set, the script passes it to the local server and authenticates its readiness probes. Unset `TYPESAFE_API_KEY` for a protected Kev evaluation so scoring uses the same key. Each probe has a 2-second connection timeout and a 5-second total timeout. Startup stops with an error if the server exits or fails to become ready within `KEV_START_TIMEOUT` seconds (default: 600; the example allows 900). Check `eval/<model>-b<batch size>[-<page>].server.log` for startup failures.
 
 ---
 
@@ -313,7 +353,8 @@ Measured against a real run on `itsecgames.com` (13,764 templates, `jev-latest`)
 | `--urls-file` | Text file with target URLs (one per line) | — |
 | `-t`, `--templates` | Path to nuclei-templates directory | required unless `--report` |
 | `--index-db` | SQLite file for the template index and `--resume` scores | `<templates>/.jev_template_index.sqlite` |
-| `--model` | TypeSafe Jev model name | `jev-latest` |
+| `--endpoint` | System One endpoint; `http://127.0.0.1:8009/v1/systemone` for a local Kev server | hosted TypeSafe |
+| `--model` | TypeSafe Jev model name (`kev-4b`, `kev-9b` with Kev) | `jev-latest` |
 | `--batch-size` | Templates per Jev API request | `50` |
 | `--url-workers` | Concurrent target-profiling threads | `4` |
 | `--workers` | Concurrent Jev scoring threads | `3` |
@@ -323,7 +364,7 @@ Measured against a real run on `itsecgames.com` (13,764 templates, `jev-latest`)
 | `--max-templates` | Debug limit on templates to evaluate | all |
 | `-o`, `--output` | Output JSON file for all URLs | — |
 | `--output-dir` | One JSON per URL in this directory | — |
-| `--resume` | Reuse stored scores from SQLite | off |
+| `--resume` | Reuse stored SQLite scores for the same endpoint, model, target, and template | off |
 | `--rebuild-index` | Force reparse all YAML files | off |
 | `--dry-run` | Profile only; no Jev calls, no scan | off |
 
@@ -382,6 +423,18 @@ nuclei-runs/
 ```
 
 Generated artifacts (`relevance.json`, `nuclei-runs/`, `*.sqlite`) are git-ignored. Reports contain absolute template paths from the machine that scored them, so re-run scoring locally rather than sharing reports between machines.
+
+---
+
+## Tests
+
+After installing the Python dependencies, run:
+
+```bash
+python -m unittest -v test_kev test_pr_regressions
+```
+
+The seven tests cover local endpoint requests, optional authorization, token-limit batch splitting, resume isolation by endpoint and model, legacy cache migration, and authenticated/open/failed evaluation readiness. They use a temporary localhost server and stub processes; no Kev weights or hosted API calls are needed.
 
 ---
 
