@@ -13,7 +13,7 @@ Pipeline:
      priority, not inclusion. Skip this step with --no-scan.
 
 Environment:
-  TYPESAFE_API_KEY=...
+  TYPESAFE_API_KEY=...   (or KEV_API_KEY; not needed for an open local Kev server via --endpoint)
 
 Example:
   python NucleiSniper.py https://a.example https://b.example \
@@ -1687,20 +1687,20 @@ def build_payload(target: dict[str, Any], batch: list[TemplateSummary], model: s
 
 def post_jev(
     payload: dict[str, Any],
-    api_key: str,
+    api_key: str | None,
     timeout: float,
     retries: int,
+    endpoint: str = TYPESAFE_ENDPOINT,
 ) -> dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
             response = requests.post(
-                TYPESAFE_ENDPOINT,
+                endpoint,
                 headers=headers,
                 json=payload,
                 timeout=timeout,
@@ -1713,6 +1713,9 @@ def post_jev(
             continue
 
         body = response.text[:800]
+        # Kev answers an oversized state with 422 instead of Jev's 400 max_tokens_exceeded.
+        if response.status_code == 422 and "token" in body.lower():
+            raise TokenLimitError(body)
         if response.status_code == 400:
             if "max_tokens_exceeded" in body:
                 raise TokenLimitError(body)
@@ -1736,17 +1739,18 @@ def evaluate_batch(
     target: dict[str, Any],
     batch: list[TemplateSummary],
     model: str,
-    api_key: str,
+    api_key: str | None,
     api_timeout: float,
     retries: int,
     label: str = "",
     timings: bool = False,
     quiet: bool = False,
+    endpoint: str = TYPESAFE_ENDPOINT,
 ) -> tuple[list[RankedTemplate], dict[str, int], float]:
     started = time.perf_counter()
     payload, key_map = build_payload(target, batch, model)
     try:
-        result = post_jev(payload, api_key, api_timeout, retries)
+        result = post_jev(payload, api_key, api_timeout, retries, endpoint)
     except TokenLimitError:
         if len(batch) < 2:
             raise
@@ -1768,6 +1772,7 @@ def evaluate_batch(
             label,
             timings,
             quiet,
+            endpoint,
         )
         right_ranked, right_usage, _right_seconds = evaluate_batch(
             batch_index,
@@ -1781,6 +1786,7 @@ def evaluate_batch(
             label,
             timings,
             quiet,
+            endpoint,
         )
         return (
             left_ranked + right_ranked,
@@ -2370,6 +2376,11 @@ def main() -> int:
         type=Path,
         help="SQLite file for the template index. Default: <templates>/.jev_template_index.sqlite. Reused when YAML mtime and size are unchanged.",
     )
+    parser.add_argument(
+        "--endpoint",
+        default=TYPESAFE_ENDPOINT,
+        help="System One endpoint. For a local Kev server: http://127.0.0.1:8009/v1/systemone (default: hosted TypeSafe)",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"TypeSafe model name (default: {DEFAULT_MODEL})")
     parser.add_argument("--batch-size", type=int, default=50, help="Templates/questions per TypeSafe request (default: 50)")
     parser.add_argument(
@@ -2555,9 +2566,10 @@ def main() -> int:
     if args.profile_only:
         return _run_profile_only(args, urls)
 
-    api_key = os.getenv("TYPESAFE_API_KEY")
-    if not api_key and not args.dry_run:
-        print("ERROR: Set TYPESAFE_API_KEY in your environment.", file=sys.stderr)
+    api_key = os.getenv("TYPESAFE_API_KEY") or os.getenv("KEV_API_KEY")
+    # A local Kev server is open by default; only hosted TypeSafe requires a key.
+    if not api_key and not args.dry_run and args.endpoint == TYPESAFE_ENDPOINT:
+        print("ERROR: Set TYPESAFE_API_KEY in your environment (or --endpoint for a local Kev server).", file=sys.stderr)
         return 2
     try:
         extra_headers = parse_headers(args.header)
@@ -2696,6 +2708,7 @@ def score_targets(
                 label,
                 args.timings,
                 _tqdm is not None,
+                args.endpoint,
             )
             jev_futures[future] = (run, idx, label)
 
@@ -2717,6 +2730,7 @@ def score_targets(
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "batch_count": 0,
                 "failed_batches": 0,
+                "batch_input_tokens": [],
                 "profile_seconds": round(seconds, 3),
                 "jev_seconds": 0.0,
                 "queued": False,
@@ -2863,6 +2877,7 @@ def score_targets(
                 run["results"].extend(ranked)
                 run["usage"]["input_tokens"] += usage["input_tokens"]
                 run["usage"]["output_tokens"] += usage["output_tokens"]
+                run["batch_input_tokens"].append(usage["input_tokens"])
                 run["jev_seconds"] = round(run["jev_seconds"] + seconds, 3)
                 if score_conn is not None:
                     store_ranked(score_conn, run["url"], args.model, ranked)
@@ -2932,6 +2947,7 @@ def score_targets(
             "target": run["target"],
             "evaluated_count": len(run["results"]),
             "failed_batches": run["failed_batches"],
+            "batch_input_tokens": run["batch_input_tokens"],
             "batch_count": run["batch_count"],
             "candidate_count": run["candidate_count"],
             "resumed_count": run.get("resumed_count", 0),

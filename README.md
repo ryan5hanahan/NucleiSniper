@@ -102,7 +102,7 @@ python --version
 
 - **Nuclei** installed and on PATH ([install guide](https://docs.projectdiscovery.io/tools/nuclei/install))
 - **Nuclei templates** cloned locally (`nuclei -update-templates`)
-- **TypeSafe API key** — set as `TYPESAFE_API_KEY` environment variable
+- **TypeSafe API key** — set as `TYPESAFE_API_KEY` environment variable, *or* a local [Kev](https://github.com/jaredpalmer/kev) server (no key; see [Example 8](#8-score-with-a-local-kev-server))
 
 ### Set Up a Virtual Environment (recommended)
 ```bash
@@ -244,6 +244,29 @@ python NucleiSniper.py http://target.com `
     --html-report report.html --no-scan
 ```
 
+### 8. Score with a Local Kev Server
+[Kev](https://github.com/jaredpalmer/kev) answers the same System One API as Jev, on your own machine. Point `--endpoint` at it; no API key is needed unless the server sets `KEV_API_KEY`.
+
+```bash
+# Terminal 1: start Kev-9B (Kev 1.0 weights; first run downloads ~19 GB)
+git clone --branch kev-1.0 https://github.com/jaredpalmer/kev.git && cd kev
+uv sync --extra serve
+uv run --extra serve python -m kev.serve --port 8009 \
+    --run jaredpalmer/kev-9b@b5d8c18e44c60888d138b65cb6507ff0a5a448a0
+
+# Terminal 2
+python NucleiSniper.py http://target.com -t ~/nuclei-templates \
+    --endpoint http://127.0.0.1:8009/v1/systemone --model kev-9b \
+    --batch-size 16 --threshold 1.0 --scan-min-score 1.0
+```
+
+Why these flags:
+- `--batch-size 16` keeps most requests near Kev's validated 8,192-token context. The default 50 sends ~15–25k tokens per request and ranks slightly worse.
+- Scores on thin pages run low with either backend: on our two test pages Jev (default batch size) scored 4 and 0 templates at 2.0 or more, Kev-9B 0 and 0, so the default `--threshold 2.5` and `--scan-min-score 2.0` kept almost nothing. At 1.0, Kev-9B kept 39 templates for the WordPress page (38 of them WordPress) and 12 for the Joomla page (all 4 Joomla templates included); Jev kept 61 and exactly the 4 Joomla templates. Kev separates relevant from irrelevant templates less sharply than Jev, so expect a few extra templates at the same cut-off.
+- Kev-9B ranked the relevant templates about as well as Jev (WordPress templates: mean rank 35 vs Jev's 34; Joomla templates: ranks 1–4 for both), but took ~26 s for 171 templates on an Apple-Silicon Mac where hosted Jev took under a second. Kev-4B (`jaredpalmer/kev-4b@139fdd94f1b6a6ad80cc15e08fcb99cac885a101`, `--model kev-4b`) is about twice as fast as Kev-9B and nearly as good. Kev-0.8B scores almost everything the same; don't use it for ranking.
+
+`eval_kev.sh` reproduces the comparison against local test pages (see `KEV_SPEC.md`).
+
 ---
 
 ## 🧠 How Scoring Works
@@ -313,7 +336,8 @@ Measured against a real run on `itsecgames.com` (13,764 templates, `jev-latest`)
 | `--urls-file` | Text file with target URLs (one per line) | — |
 | `-t`, `--templates` | Path to nuclei-templates directory | required unless `--report` |
 | `--index-db` | SQLite file for the template index and `--resume` scores | `<templates>/.jev_template_index.sqlite` |
-| `--model` | TypeSafe Jev model name | `jev-latest` |
+| `--endpoint` | System One endpoint; `http://127.0.0.1:8009/v1/systemone` for a local Kev server | hosted TypeSafe |
+| `--model` | TypeSafe Jev model name (`kev-4b`, `kev-9b` with Kev) | `jev-latest` |
 | `--batch-size` | Templates per Jev API request | `50` |
 | `--url-workers` | Concurrent target-profiling threads | `4` |
 | `--workers` | Concurrent Jev scoring threads | `3` |
